@@ -14,29 +14,39 @@ function verifySignature(rawBody, header) {
 function normEvt(evt){ return (evt||"").toLowerCase().replace(/_/g,"."); }
 function toInt(v,d=1){ const n=parseInt(v,10); return Number.isFinite(n)?n:d; }
 
-// 1) extraction "classique"
-function extractQty(payload){
-  let val = payload?.bookingFieldsResponses?.places
-         ?? payload?.bookingFieldsResponses?.nombre_de_participants;
+// ====== helpers d'extraction ======
+function extractQtyFromBooking(b){
+  let val = b?.bookingFieldsResponses?.places
+         ?? b?.bookingFieldsResponses?.nombre_de_participants;
 
-  if (val==null && payload?.bookingFieldsResponses && !Array.isArray(payload.bookingFieldsResponses)){
-    const obj = payload.bookingFieldsResponses;
+  if (val==null && b?.bookingFieldsResponses && !Array.isArray(b.bookingFieldsResponses)){
+    const obj = b.bookingFieldsResponses;
     const k = Object.keys(obj).find(k=>k.toLowerCase().includes("place"));
     if (k) val = obj[k];
   }
 
-  const arrays=[];
-  if (Array.isArray(payload?.responses)) arrays.push(payload.responses);
-  if (Array.isArray(payload?.formResponses)) arrays.push(payload.formResponses);
+  const arrays = [];
+  if (Array.isArray(b?.responses)) arrays.push(b.responses);
+  if (Array.isArray(b?.formResponses)) arrays.push(b.formResponses);
+  if (Array.isArray(b?.answers)) arrays.push(b.answers);
+  if (Array.isArray(b?.attendees?.[0]?.responses)) arrays.push(b.attendees[0].responses);
+
   for(const arr of arrays){
-    const hit = arr.find(f=>((f?.key||f?.id||f?.name||f?.label||"")+"").toLowerCase().includes("place"));
-    if (hit){ val = hit.value ?? hit.answer ?? hit.response ?? hit.number ?? val; break; }
+    const hit = arr.find(f => (
+      ((f?.key||f?.slug||f?.id||f?.name||f?.label||"")+"").toLowerCase().includes("place")
+      || ((f?.question||"")+"").toLowerCase().includes("place")
+      || ((f?.label||"")+"").toLowerCase().includes("participant")
+    ));
+    if (hit){
+      val = hit.value ?? hit.answer ?? hit.response ?? hit.number ?? hit.text ?? val;
+      break;
+    }
   }
 
-  return Math.max(1, Math.min(15, toInt(val,1)));
+  const qty = Math.max(1, Math.min(15, toInt(val,1)));
+  return qty;
 }
 
-// 2) extraction "au cas où" (cherche partout une clé/label contenant 'place' ou 'participant')
 function deepFindQty(obj){
   let found = null;
   const stack = [obj];
@@ -60,6 +70,25 @@ function deepFindQty(obj){
   if (found==null) return null;
   return Math.max(1, Math.min(15, found));
 }
+// =================================
+
+async function fetchBookingDetails(uidOrId){
+  const url = `https://api.cal.com/v2/bookings/${encodeURIComponent(uidOrId)}`;
+  const res = await fetch(url, {
+    headers: {
+      "Authorization": `Bearer ${CAL_API_KEY}`,
+      "cal-api-version": CAL_API_VERSION
+    }
+  });
+  if (!res.ok) {
+    const txt = await res.text();
+    console.error("CAL ▶ details failed", res.status, txt);
+    return null;
+  }
+  const j = await res.json();
+  // Selon la version, la réponse peut être { booking: {...} } ou directement l'objet
+  return j?.booking ?? j;
+}
 
 // Healthcheck
 export async function GET(){ return NextResponse.json({ok:true,source:"cal-webhook"}); }
@@ -75,17 +104,34 @@ export async function POST(req){
     const evt = normEvt(body?.triggerEvent || body?.type);
     if(!evt.includes("booking.created")) return NextResponse.json({ok:true,skipped:evt||"unknown"});
 
+    // booking primaire reçu dans le webhook
     const b = body?.payload || body?.data || {};
+    const uid = b?.uid || b?.id;
 
     // ignorer les "enfants" qu'on crée nous-mêmes
     if (b?.metadata?.multiParentUid) return NextResponse.json({ok:true,skipped:"child booking"});
 
-    // --- qty
-    let qty = extractQty(b);
-    if (qty===1) {
-      const alt = deepFindQty(b);
-      if (alt!=null) qty = alt;
+    // 1) tentative d'extraction directe
+    let qty = extractQtyFromBooking(b);
+
+    // 2) si toujours 1, on va chercher les détails via l'API
+    if (qty === 1 && uid && CAL_API_KEY) {
+      const detail = await fetchBookingDetails(uid);
+      if (detail) {
+        const fromDetail = extractQtyFromBooking(detail) ?? deepFindQty(detail);
+        if (fromDetail && fromDetail > 1) qty = fromDetail;
+        // log debug : pour nous aider si besoin
+        console.log("CAL ▶ booking.details snapshot", {
+          uid,
+          hasBFR: !!detail?.bookingFieldsResponses,
+          keys: Object.keys(detail || {}),
+          responsesLen: Array.isArray(detail?.responses) ? detail.responses.length : 0,
+          formResponsesLen: Array.isArray(detail?.formResponses) ? detail.formResponses.length : 0,
+          answersLen: Array.isArray(detail?.answers) ? detail.answers.length : 0
+        });
+      }
     }
+
     const extra = qty - 1;
 
     // --- infos slot & attendee
@@ -95,10 +141,8 @@ export async function POST(req){
       (Array.isArray(b?.attendees) && b.attendees[0]) ||
       b?.attendee || { name:"Invité", email:"no-reply@cosette.fr", timeZone:"Europe/Paris" };
 
-    // LOGS DIAGNOSTIC (visible dans Vercel → Logs)
     console.log("CAL ▶ booking.created", {
-      qty, extra, eventTypeId, startISO,
-      attendeeEmail: attendee?.email,
+      qty, extra, eventTypeId, startISO, attendeeEmail: attendee?.email,
       bookingFieldsResponses: b?.bookingFieldsResponses,
       responsesArrLen: Array.isArray(b?.responses) ? b.responses.length : 0,
       formResponsesArrLen: Array.isArray(b?.formResponses) ? b.formResponses.length : 0
