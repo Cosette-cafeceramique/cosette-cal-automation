@@ -1,127 +1,115 @@
 import crypto from "crypto";
 import { NextResponse } from "next/server";
 
-// Réglages
-const CAL_API_KEY = process.env.CAL_API_KEY;               // Cal.com → Settings → Developer → API Keys
-const CAL_WEBHOOK_SECRET = process.env.CAL_WEBHOOK_SECRET; // Tu le définis en créant le webhook (étape 4)
-const CAL_API_VERSION = "2024-08-13";                      // Garde cette valeur
+const CAL_API_KEY = process.env.CAL_API_KEY;
+const CAL_WEBHOOK_SECRET = process.env.CAL_WEBHOOK_SECRET;
+const CAL_API_VERSION = "2024-08-13";
 
-// Vérif HMAC (signature Cal)
 function verifySignature(rawBody, header) {
   if (!CAL_WEBHOOK_SECRET || !header) return false;
   const digest = crypto.createHmac("sha256", CAL_WEBHOOK_SECRET).update(rawBody).digest("hex");
   return header === digest;
 }
 
-// Pour tests/healthcheck
-export async function GET() {
-  return NextResponse.json({ ok: true, source: "cal-webhook" });
-}
-export async function HEAD() {
-  return new NextResponse(null, { status: 200 });
+function normEvt(evt){ return (evt||"").toLowerCase().replace(/_/g,"."); }
+function toInt(v,d=1){ const n=parseInt(v,10); return Number.isFinite(n)?n:d; }
+
+// — récupère la quantité même si la clé n'est pas exactement "places"
+function extractQty(payload){
+  let val = payload?.bookingFieldsResponses?.places
+         ?? payload?.bookingFieldsResponses?.nombre_de_participants;
+
+  if (val==null && payload?.bookingFieldsResponses && !Array.isArray(payload.bookingFieldsResponses)){
+    const obj = payload.bookingFieldsResponses;
+    const k = Object.keys(obj).find(k=>k.toLowerCase().includes("place"));
+    if (k) val = obj[k];
+  }
+  const arrays=[];
+  if (Array.isArray(payload?.responses)) arrays.push(payload.responses);
+  if (Array.isArray(payload?.formResponses)) arrays.push(payload.formResponses);
+  for(const arr of arrays){
+    const hit = arr.find(f=>((f?.key||f?.id||f?.name||f?.label||"")+"").toLowerCase().includes("place"));
+    if (hit){ val = hit.value ?? hit.answer ?? hit.response ?? hit.number ?? val; break; }
+  }
+  return Math.max(1, Math.min(15, toInt(val,1)));
 }
 
-// Réception réelle
-export async function POST(req) {
-  try {
+// Healthcheck
+export async function GET(){ return NextResponse.json({ok:true,source:"cal-webhook"}); }
+export async function HEAD(){ return new NextResponse(null,{status:200}); }
+
+export async function POST(req){
+  try{
     const raw = await req.text();
     const sig = req.headers.get("x-cal-signature-256");
-    if (!verifySignature(raw, sig)) {
-      return NextResponse.json({ ok: false, error: "invalid signature" }, { status: 401 });
-    }
+    if(!verifySignature(raw,sig)) return NextResponse.json({ok:false,error:"invalid signature"},{status:401});
 
-    const body = JSON.parse(raw || "{}");
-    // Le type d’événement
-    const evt = body?.triggerEvent || body?.type || "";
-    if (!`${evt}`.toLowerCase().includes("booking.created")) {
-      return NextResponse.json({ ok: true, skipped: "not booking.created" });
-    }
+    const body = JSON.parse(raw||"{}");
+    const evt = normEvt(body?.triggerEvent||body?.type);
+    if(!evt.includes("booking.created")) return NextResponse.json({ok:true,skipped:evt||"unknown"});
 
-    // Cal envoie l’objet réservation dans payload/data
     const b = body?.payload || body?.data || {};
-    // Anti-boucle : si c’est une résa que NOUS avons créée en plus, on stoppe
-    if (b?.metadata?.multiParentUid) {
-      return NextResponse.json({ ok: true, skipped: "child booking" });
-    }
+    if (b?.metadata?.multiParentUid) return NextResponse.json({ok:true,skipped:"child booking"});
 
-    // On récupère la quantité demandée par le client (champ "Nombre de places")
-    const qtyRaw =
-      b?.bookingFieldsResponses?.places ??
-      b?.responses?.places ??
-      b?.formResponses?.places ??
-      1;
-
-    const qty = Math.max(1, Math.min(15, parseInt(qtyRaw || 1, 10)));
-    const extra = qty - 1; // car 1 place est déjà prise par cette réservation
-
-    if (extra <= 0) {
-      return NextResponse.json({ ok: true, info: "single seat" });
-    }
-
-    // Infos de base pour dupliquer
+    const qty = extractQty(b);
+    const extra = qty - 1;
     const eventTypeId = b?.eventTypeId || b?.eventType?.id;
-    const startISO = b?.start || b?.when?.startTime;   // ex: "2025-11-20T09:00:00Z"
-    const primaryAttendee =
-      (b?.attendees && b.attendees[0]) ||
-      b?.attendee || { name: "Invité", email: "no-reply@cosette.fr", timeZone: "Europe/Paris" };
+    const startISO = b?.start || b?.startTime || b?.when?.startTime || b?.when?.start;
+    const attendee =
+      (Array.isArray(b?.attendees) && b.attendees[0]) ||
+      b?.attendee || { name:"Invité", email:"no-reply@cosette.fr", timeZone:"Europe/Paris" };
 
-    if (!eventTypeId || !startISO || !primaryAttendee?.email) {
-      return NextResponse.json(
-        { ok: false, error: "missing data (eventTypeId/start/attendee)" },
-        { status: 400 }
-      );
-    }
-    if (!CAL_API_KEY) {
-      return NextResponse.json({ ok: false, error: "missing CAL_API_KEY" }, { status: 500 });
+    console.log("CAL ▶ booking.created", { qty, extra, eventTypeId, startISO, email: attendee?.email });
+
+    if(!CAL_API_KEY) return NextResponse.json({ok:false,error:"missing CAL_API_KEY"},{status:500});
+    if(!eventTypeId || !startISO || !attendee?.email){
+      console.error("CAL ▶ missing data", { eventTypeId, startISO, attendeeEmail: attendee?.email });
+      return NextResponse.json({ok:false,error:"missing eventTypeId/start/attendee"},{status:400});
     }
 
-    // Création des N–1 résas supplémentaires
+    if (extra<=0) return NextResponse.json({ok:true,info:"single seat",qty});
+
     const headers = {
-      "Content-Type": "application/json",
-      "Authorization": `Bearer ${CAL_API_KEY}`,
-      "cal-api-version": CAL_API_VERSION
+      "Content-Type":"application/json",
+      "Authorization":`Bearer ${CAL_API_KEY}`,
+      "cal-api-version":CAL_API_VERSION
     };
 
-    const created = [];
-    for (let i = 0; i < extra; i++) {
-      const res = await fetch("https://api.cal.com/v2/bookings", {
+    let created = 0;
+    for (let i=0;i<extra;i++){
+      const r = await fetch("https://api.cal.com/v2/bookings", {
         method: "POST",
         headers,
         body: JSON.stringify({
           eventTypeId,
-          start: startISO,                  // la même heure/slot
-          timeZone: primaryAttendee.timeZone || "Europe/Paris",
-          attendees: [
-            {
-              name: primaryAttendee.name,
-              email: primaryAttendee.email,
-              timeZone: primaryAttendee.timeZone || "Europe/Paris"
-            }
-          ],
-          // Marqueur pour éviter de re-traiter nos propres créations
-          metadata: {
-            multiParentUid: b?.uid || b?.id || "primary"
-          },
-          // Optionnel : garder trace de la quantité totale demandée
-          bookingFieldsResponses: {
-            places: qty
-          }
+          start: startISO, // même slot (UTC)
+          timeZone: attendee.timeZone || "Europe/Paris",
+          attendees: [{
+            name: attendee.name || "Invité",
+            email: attendee.email,
+            timeZone: attendee.timeZone || "Europe/Paris"
+          }],
+          metadata: { multiParentUid: b?.uid || b?.id || "primary" },
+          bookingFieldsResponses: { places: qty }
         })
       });
-
-      if (!res.ok) {
-        const t = await res.text();
-        // On arrête proprement si la capacité est dépassée, etc.
+      if(!r.ok){
+        const txt = await r.text();
+        console.error("CAL ▶ create failed", r.status, txt);
         return NextResponse.json(
-          { ok: false, error: `create booking failed: ${res.status} ${t}` },
-          { status: 400 }
+          { ok:false, error:"create failed", status:r.status, details:txt },
+          { status:400 }
         );
       }
-      created.push(await res.json());
+      await r.json();
+      created++;
     }
 
-    return NextResponse.json({ ok: true, created: created.length, qty, extra });
-  } catch (e) {
-    return NextResponse.json({ ok: false, error: e?.message || String(e) }, { status: 500 });
+    console.log("CAL ▶ created extra bookings:", created);
+    return NextResponse.json({ ok:true, qty, extra, created });
+
+  } catch (e){
+    console.error("CAL ▶ error", e);
+    return NextResponse.json({ ok:false, error:e?.message || String(e) }, { status:500 });
   }
 }
