@@ -14,7 +14,7 @@ function verifySignature(rawBody, header) {
 function normEvt(evt){ return (evt||"").toLowerCase().replace(/_/g,"."); }
 function toInt(v,d=1){ const n=parseInt(v,10); return Number.isFinite(n)?n:d; }
 
-// — récupère la quantité même si la clé n'est pas exactement "places"
+// 1) extraction "classique"
 function extractQty(payload){
   let val = payload?.bookingFieldsResponses?.places
          ?? payload?.bookingFieldsResponses?.nombre_de_participants;
@@ -24,6 +24,7 @@ function extractQty(payload){
     const k = Object.keys(obj).find(k=>k.toLowerCase().includes("place"));
     if (k) val = obj[k];
   }
+
   const arrays=[];
   if (Array.isArray(payload?.responses)) arrays.push(payload.responses);
   if (Array.isArray(payload?.formResponses)) arrays.push(payload.formResponses);
@@ -31,7 +32,33 @@ function extractQty(payload){
     const hit = arr.find(f=>((f?.key||f?.id||f?.name||f?.label||"")+"").toLowerCase().includes("place"));
     if (hit){ val = hit.value ?? hit.answer ?? hit.response ?? hit.number ?? val; break; }
   }
+
   return Math.max(1, Math.min(15, toInt(val,1)));
+}
+
+// 2) extraction "au cas où" (cherche partout une clé/label contenant 'place' ou 'participant')
+function deepFindQty(obj){
+  let found = null;
+  const stack = [obj];
+  while (stack.length && found == null){
+    const cur = stack.pop();
+    if (cur && typeof cur === "object"){
+      if (Array.isArray(cur)){
+        for (const v of cur) stack.push(v);
+      } else {
+        for (const [k,v] of Object.entries(cur)){
+          const key = (k||"").toLowerCase();
+          if (typeof v !== "object" && (key.includes("place") || key.includes("participant"))){
+            const n = parseInt(v,10);
+            if (Number.isFinite(n)) { found = n; break; }
+          }
+          stack.push(v);
+        }
+      }
+    }
+  }
+  if (found==null) return null;
+  return Math.max(1, Math.min(15, found));
 }
 
 // Healthcheck
@@ -45,21 +72,37 @@ export async function POST(req){
     if(!verifySignature(raw,sig)) return NextResponse.json({ok:false,error:"invalid signature"},{status:401});
 
     const body = JSON.parse(raw||"{}");
-    const evt = normEvt(body?.triggerEvent||body?.type);
+    const evt = normEvt(body?.triggerEvent || body?.type);
     if(!evt.includes("booking.created")) return NextResponse.json({ok:true,skipped:evt||"unknown"});
 
     const b = body?.payload || body?.data || {};
+
+    // ignorer les "enfants" qu'on crée nous-mêmes
     if (b?.metadata?.multiParentUid) return NextResponse.json({ok:true,skipped:"child booking"});
 
-    const qty = extractQty(b);
+    // --- qty
+    let qty = extractQty(b);
+    if (qty===1) {
+      const alt = deepFindQty(b);
+      if (alt!=null) qty = alt;
+    }
     const extra = qty - 1;
+
+    // --- infos slot & attendee
     const eventTypeId = b?.eventTypeId || b?.eventType?.id;
     const startISO = b?.start || b?.startTime || b?.when?.startTime || b?.when?.start;
     const attendee =
       (Array.isArray(b?.attendees) && b.attendees[0]) ||
       b?.attendee || { name:"Invité", email:"no-reply@cosette.fr", timeZone:"Europe/Paris" };
 
-    console.log("CAL ▶ booking.created", { qty, extra, eventTypeId, startISO, email: attendee?.email });
+    // LOGS DIAGNOSTIC (visible dans Vercel → Logs)
+    console.log("CAL ▶ booking.created", {
+      qty, extra, eventTypeId, startISO,
+      attendeeEmail: attendee?.email,
+      bookingFieldsResponses: b?.bookingFieldsResponses,
+      responsesArrLen: Array.isArray(b?.responses) ? b.responses.length : 0,
+      formResponsesArrLen: Array.isArray(b?.formResponses) ? b.formResponses.length : 0
+    });
 
     if(!CAL_API_KEY) return NextResponse.json({ok:false,error:"missing CAL_API_KEY"},{status:500});
     if(!eventTypeId || !startISO || !attendee?.email){
@@ -82,7 +125,7 @@ export async function POST(req){
         headers,
         body: JSON.stringify({
           eventTypeId,
-          start: startISO, // même slot (UTC)
+          start: startISO,
           timeZone: attendee.timeZone || "Europe/Paris",
           attendees: [{
             name: attendee.name || "Invité",
